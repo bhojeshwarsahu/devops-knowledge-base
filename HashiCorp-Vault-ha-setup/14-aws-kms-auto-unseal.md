@@ -1,0 +1,535 @@
+# HashiCorp Vault — AWS KMS Auto-Unseal
+
+> **Vault Cluster:** `vault-ha-cluster`  
+> **Nodes:** `vault-node-1` (active), `vault-node-2` (standby), `vault-node-3` (standby)  
+> **AWS Account:** `xxxxxxxxxxxx`  
+> **KMS Key Alias:** `alias/vault-auto-unseal`  
+> Vault automatically unseals on restart using AWS KMS — zero human intervention needed.
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [How Auto-Unseal Works](#2-how-auto-unseal-works)
+3. [Manual vs Auto-Unseal](#3-manual-vs-auto-unseal)
+4. [AWS KMS Setup](#4-aws-kms-setup)
+5. [IAM Permissions](#5-iam-permissions)
+6. [Vault Configuration](#6-vault-configuration)
+7. [Seal Migration — Shamir to KMS](#7-seal-migration--shamir-to-kms)
+8. [Verifying Auto-Unseal](#8-verifying-auto-unseal)
+9. [Recovery Keys](#9-recovery-keys)
+10. [Troubleshooting](#10-troubleshooting)
+11. [Production Checklist](#11-production-checklist)
+
+---
+
+## 1. Overview
+
+### What is Auto-Unseal?
+
+Every time Vault starts or restarts, it begins in a **sealed state** — all data is
+encrypted and nothing is accessible. Normally a human must enter 3 of 5 unseal keys
+to bring Vault back online.
+
+Auto-unseal delegates this process to **AWS KMS**. Vault automatically calls KMS on
+startup to decrypt its master key — no human intervention needed.
+
+### Why it matters
+
+```
+3am — vault-node-1 crashes due to kernel update
+
+Without auto-unseal:
+  Someone wakes up at 3am
+  Finds 3 people with unseal keys
+  Manually enters keys one by one
+  Vault back online after 15-30 min downtime
+  On-call engineer very unhappy
+
+With auto-unseal:
+  Vault restarts automatically
+  Calls AWS KMS → gets master key
+  Unseals in 5 seconds
+  Nobody wakes up
+  Everything continues normally
+```
+
+---
+
+## 2. How Auto-Unseal Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  Vault node restarts (crash, update, manual restart)            │
+│       │                                                         │
+│       │  ① Vault starts in sealed state                        │
+│       │     reads vault.hcl → finds seal "awskms" block        │
+│       ▼                                                         │
+│  Vault sends encrypted master key blob to AWS KMS               │
+│       │                                                         │
+│       │  ② kms:Decrypt request                                 │
+│       │     using vault-server-role IAM identity                │
+│       ▼                                                         │
+│  AWS KMS                                                        │
+│       │                                                         │
+│       │  ③ verifies vault-server-role has kms:Decrypt          │
+│       │     decrypts the master key blob                        │
+│       │     returns plaintext master key                        │
+│       ▼                                                         │
+│  Vault uses master key to decrypt its storage                   │
+│       │                                                         │
+│       │  ④ Sealed: false — fully operational                   │
+│       │     total time: ~3-5 seconds                            │
+│       ▼                                                         │
+│  Applications continue without interruption                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### What protects this?
+
+```
+The KMS key never leaves AWS.
+Vault only sends an ENCRYPTED blob to KMS — not the master key itself.
+KMS decrypts it and returns the result.
+
+Attacker needs BOTH:
+  ① Access to Vault's encrypted storage data
+  ② IAM permission to call kms:Decrypt on the specific KMS key
+
+IAM policy controls which EC2 instances can call kms:Decrypt.
+Only vault-server-role has this permission.
+```
+
+---
+
+## 3. Manual vs Auto-Unseal
+
+| | Manual (Shamir) | Auto-Unseal (AWS KMS) |
+|---|---|---|
+| **Unseal on restart** | 3 humans with keys required | Automatic — 5 seconds |
+| **3am crash** | Someone wakes up | Nobody wakes up |
+| **Key storage** | 5 unseal keys distributed to people | KMS key in AWS — never exposed |
+| **HA cluster restart** | Each node needs manual unseal | All nodes unseal automatically |
+| **Security** | Keys can be lost/leaked by humans | IAM-controlled, full audit trail |
+| **Recovery** | Use unseal keys | Use recovery keys (emergency only) |
+
+---
+
+## 4. AWS KMS Setup
+
+### Create the KMS key
+
+```
+AWS Console → KMS → Customer managed keys → Create key
+
+Key type:      Symmetric
+Key spec:      SYMMETRIC_DEFAULT
+Key usage:     Encrypt and decrypt
+Origin:        AWS KMS
+Regionality:   Single-Region
+
+Alias:         vault-auto-unseal
+Description:   Vault HA cluster auto-unseal key
+
+Key administrators:  sahu (IAM user)
+Key users:           vault-server-role
+```
+
+### Key policy (auto-generated by AWS Console)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Enable IAM User Permissions",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::xxxxxxxxxxxx:root"
+      },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "Allow access for Key Administrators",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::xxxxxxxxxxxx:user/sahu"
+      },
+      "Action": [
+        "kms:Create*", "kms:Describe*", "kms:Enable*",
+        "kms:List*", "kms:Put*", "kms:Update*",
+        "kms:Revoke*", "kms:Disable*", "kms:Get*",
+        "kms:Delete*", "kms:TagResource", "kms:UntagResource",
+        "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Allow use of the key",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::xxxxxxxxxxxx:role/vault-server-role"
+      },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Allow attachment of persistent resources",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::xxxxxxxxxxxx:role/vault-server-role"
+      },
+      "Action": [
+        "kms:CreateGrant",
+        "kms:ListGrants",
+        "kms:RevokeGrant"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Bool": {
+          "kms:GrantIsForAWSResource": "true"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 5. IAM Permissions
+
+### Attach vault-server-role to ALL nodes
+
+All three nodes must have `vault-server-role` attached — not just the leader.
+
+```
+EC2 → Instances → vault-node-1
+→ Actions → Security → Modify IAM role → vault-server-role ✅
+
+EC2 → Instances → vault-node-2
+→ Actions → Security → Modify IAM role → vault-server-role ✅
+
+EC2 → Instances → vault-node-3
+→ Actions → Security → Modify IAM role → vault-server-role ✅
+```
+
+> **Common mistake:** Only attaching the IAM role to the leader node.
+> Standby nodes also need KMS access or they fail to start after restart.
+
+### Verify IAM role on each node
+
+```bash
+# run on each node
+curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# must return: vault-server-role
+```
+
+### vault-sts-policy — required permissions
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "iam:GetRole",
+        "sts:AssumeRole",
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+---
+
+## 6. Vault Configuration
+
+### vault.hcl — seal block (same on all three nodes)
+
+Add the `seal "awskms"` block to `/etc/vault.d/vault.hcl` on every node:
+
+```hcl
+ui            = true
+cluster_name  = "vault-ha-cluster"
+disable_mlock = true
+
+# AUTO-UNSEAL — AWS KMS
+seal "awskms" {
+  region     = "us-east-1"
+  kms_key_id = "alias/vault-auto-unseal"
+}
+
+storage "raft" {
+  path    = "/opt/vault/data"
+  node_id = "vault-node-1"           # change per node
+  retry_join {
+    leader_api_addr         = "https://172.31.93.237:8200"
+    leader_ca_cert_file     = "/etc/vault.d/tls/ca.crt"
+    leader_client_cert_file = "/etc/vault.d/tls/vault-node-1.crt"
+    leader_client_key_file  = "/etc/vault.d/tls/vault-node-1.key"
+  }
+  retry_join {
+    leader_api_addr         = "https://172.31.20.21:8200"
+    leader_ca_cert_file     = "/etc/vault.d/tls/ca.crt"
+    leader_client_cert_file = "/etc/vault.d/tls/vault-node-1.crt"
+    leader_client_key_file  = "/etc/vault.d/tls/vault-node-1.key"
+  }
+}
+
+listener "tcp" {
+  address            = "0.0.0.0:8200"
+  cluster_address    = "0.0.0.0:8201"
+  tls_cert_file      = "/etc/vault.d/tls/vault-node-1.crt"
+  tls_key_file       = "/etc/vault.d/tls/vault-node-1.key"
+  tls_client_ca_file = "/etc/vault.d/tls/ca.crt"
+}
+
+api_addr     = "https://172.31.10.120:8200"
+cluster_addr = "https://172.31.10.120:8201"
+```
+
+> Change `node_id`, cert file names, `api_addr`, and `cluster_addr` per node.
+> The `seal "awskms"` block is identical on all three nodes.
+
+---
+
+## 7. Seal Migration — Shamir to KMS
+
+This is a one-time process. Once migrated, Vault uses KMS permanently.
+
+### Order of operations — standbys first, leader last
+
+```
+vault-node-2 (standby)  →  restart + migrate first
+vault-node-3 (standby)  →  restart + migrate second
+vault-node-1 (leader)   →  restart + migrate last
+```
+
+Restarting standbys first keeps the cluster serving requests during migration.
+
+### On each node (repeat for all three)
+
+```bash
+# set environment
+export VAULT_ADDR="https://127.0.0.1:8200"
+export VAULT_CACERT="/etc/vault.d/tls/ca.crt"
+
+# restart vault to load new seal config
+sudo systemctl restart vault
+
+# verify KMS seal is loaded
+vault status | grep "Seal Type"
+# Seal Type    awskms   ← must show this before migrating
+
+# migrate — enter existing shamir unseal keys 3 times
+vault operator unseal -migrate
+# Unseal Key (will be hidden): [key 1]
+
+vault operator unseal -migrate
+# Unseal Key (will be hidden): [key 2]
+
+vault operator unseal -migrate
+# Unseal Key (will be hidden): [key 3]
+```
+
+Expected output after 3rd key:
+```
+Seal Type                awskms
+Recovery Seal Type       shamir
+Sealed                   false
+```
+
+### Common migration error
+
+```
+Error: can't perform a seal migration, no migration seal found
+
+Cause:  Vault process running with OLD config (before restart)
+Fix:    sudo systemctl restart vault FIRST, then run -migrate
+```
+
+---
+
+## 8. Verifying Auto-Unseal
+
+### Check seal type on all nodes
+
+```bash
+vault status | grep -E "Seal Type|Sealed|HA Mode"
+```
+
+Expected on all three nodes:
+```
+Seal Type                awskms
+Recovery Seal Type       shamir
+Sealed                   false
+HA Mode                  active/standby
+```
+
+### Check cluster members
+
+```bash
+vault operator members
+```
+
+```
+Host Name      API Address                  Active Node
+---------      -----------                  -----------
+vault-node-1   https://172.31.10.120:8200   true
+vault-node-2   https://172.31.93.237:8200   false
+vault-node-3   https://172.31.20.21:8200    false
+```
+
+### The real test — restart and verify auto-unseal
+
+```bash
+# restart vault — no unseal keys will be entered
+sudo systemctl restart vault
+
+# wait 5 seconds
+sleep 5
+
+# check — must show Sealed: false with zero human input
+vault status | grep -E "Seal Type|Sealed"
+```
+
+Actual output from this setup:
+```
+Seal Type                awskms
+Recovery Seal Type       shamir
+Sealed                   false    ← automatically unsealed by KMS
+```
+
+---
+
+## 9. Recovery Keys
+
+After migrating to auto-unseal, your old Shamir unseal keys become **recovery keys**.
+
+### What recovery keys are for
+
+```
+Normal operation:
+  Vault restarts → KMS handles unseal automatically
+  Recovery keys NOT needed
+
+Emergency situations only:
+  ① AWS KMS is unavailable / unreachable
+  ② Need to generate a new root token
+  ③ KMS key accidentally deleted
+  ④ Disaster recovery scenario
+```
+
+### Using recovery keys
+
+```bash
+# emergency manual unseal (KMS unavailable)
+vault operator unseal -recovery-token
+
+# generate root token using recovery keys
+vault operator generate-root -recovery-token
+```
+
+### Storing recovery keys safely
+
+```
+✅  Store in a password manager (1Password, Bitwarden)
+✅  Print and store in a physical safe
+✅  Distribute to different trusted people (no single point of failure)
+✅  Store in a separate AWS account (not the same one as Vault)
+❌  Never store all 5 in one place
+❌  Never store in the same system as Vault
+❌  Never commit to git or store in config files
+```
+
+---
+
+## 10. Troubleshooting
+
+| Error | Root Cause | Fix |
+|---|---|---|
+| `NoCredentialProviders: no valid providers in chain` | EC2 has no IAM role attached | Attach `vault-server-role` to the EC2 instance |
+| `can't perform a seal migration, no migration seal found` | Vault process not restarted after adding seal block | Run `sudo systemctl restart vault` first |
+| `AccessDenied: kms:Decrypt` | IAM role missing KMS permissions | Add `kms:Decrypt` and `kms:DescribeKey` to `vault-sts-policy` |
+| `KMS key not found` | Wrong key alias or region | Verify `kms_key_id = "alias/vault-auto-unseal"` and `region = "us-east-1"` |
+| `Vault sealed after restart` | KMS unreachable (network issue) | Check outbound internet from EC2 to KMS endpoint |
+| `error fetching AWS KMS wrapping key` | IAM role not attached to node | Attach `vault-server-role` to all three EC2 instances |
+
+### Debug commands
+
+```bash
+# check vault seal status
+vault status | grep -E "Seal Type|Sealed"
+
+# check IAM role on instance
+curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# check vault logs for KMS errors
+sudo journalctl -u vault -n 50 | grep -E "kms|seal|error"
+
+# verify KMS key exists
+aws kms describe-key --key-id alias/vault-auto-unseal --region us-east-1
+
+# test KMS access from EC2
+aws kms list-keys --region us-east-1
+```
+
+---
+
+## 11. Production Checklist
+
+- [ ] KMS key created in same region as Vault EC2 instances
+- [ ] `vault-server-role` attached to ALL three nodes — not just the leader
+- [ ] `vault-sts-policy` includes `kms:Encrypt`, `kms:Decrypt`, `kms:DescribeKey`
+- [ ] `seal "awskms"` block added to `vault.hcl` on all three nodes
+- [ ] Seal migration completed on all three nodes (standbys first, leader last)
+- [ ] Auto-unseal tested by restarting each node and verifying `Sealed: false`
+- [ ] Recovery keys stored securely in multiple safe locations
+- [ ] KMS key rotation enabled (AWS handles this automatically)
+- [ ] CloudWatch alarm set for KMS key usage anomalies
+- [ ] Vault audit log enabled to track all unseal events:
+
+```bash
+vault audit enable file file_path=/var/log/vault/audit.log
+```
+
+- [ ] Test disaster recovery — simulate KMS unavailability with recovery keys
+
+---
+
+## Cluster Summary
+
+| Node | Private IP | Role | IAM Role | Seal Type |
+|---|---|---|---|---|
+| `vault-node-1` | `172.31.10.120` | Active/Leader | `vault-server-role` | `awskms` ✅ |
+| `vault-node-2` | `172.31.93.237` | Standby | `vault-server-role` | `awskms` ✅ |
+| `vault-node-3` | `172.31.20.21` | Standby | `vault-server-role` | `awskms` ✅ |
+
+| Resource | Value |
+|---|---|
+| KMS Key Alias | `alias/vault-auto-unseal` |
+| KMS Region | `us-east-1` |
+| IAM Policy | `vault-sts-policy` |
+| IAM Role | `vault-server-role` |
+| Recovery Keys | 5 (threshold: 3) |
+
+---
+
+*Practice setup — vault-ha-cluster — AWS account: xxxxxxxxxxxx*
